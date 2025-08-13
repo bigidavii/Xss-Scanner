@@ -22,6 +22,9 @@ jobs:
       - name: Clone storage repo and copy files
         run: |
           git clone ${{ github.event.client_payload.storage_repo }} storage
+          echo "--- Listing contents of cloned repository ---"
+          ls -R storage
+          echo "-------------------------------------------"
           mkdir -p combined-results
           cp storage/${{ github.event.client_payload.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
       - name: Check if files exist
