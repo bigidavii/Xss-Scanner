@@ -1,30 +1,8 @@
-name: "X8 & KXSS Scanning Workflow"
+name: "XSS Scanner Workflow"
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_name:
-        description: 'Name of target folder in storage repo (e.g., example-com)'
-        required: true
-        type: string
-      storage_repo:
-        description: 'SSH URL of scan-results-storage repo'
-        required: true
-        type: string
-      custom_headers:
-        description: 'Optional: Custom headers (e.g., Cookie: test=value)'
-        required: false
-        type: string
-      run_x8:
-        description: 'Run the x8 scanner?'
-        required: false
-        type: boolean
-        default: true
-      run_kxss:
-        description: 'Run the kxss scanner?'
-        required: false
-        type: boolean
-        default: true
+  repository_dispatch:
+    types: [xss-scan]
 
 jobs:
   fetch-results:
@@ -43,9 +21,9 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Clone storage repo and copy files
         run: |
-          git clone ${{ github.event.inputs.storage_repo }} storage
+          git clone ${{ github.event.client_payload.storage_repo }} storage
           mkdir -p combined-results
-          cp storage/${{ github.event.inputs.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
+          cp storage/${{ github.event.client_payload.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
       - name: Check if files exist
         id: check_files
         run: |
@@ -121,7 +99,7 @@ jobs:
 
   x8-scan:
     needs: [fetch-results, consolidate-httpx]
-    if: "${{ github.event.inputs.run_x8 == 'true' && needs.fetch-results.outputs.params_exist == 'true' }}"
+    if: "github.event.client_payload.run_x8 == 'true' && needs.fetch-results.outputs.params_exist == 'true'"
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -158,11 +136,17 @@ jobs:
             touch x8-chunk-${{ matrix.chunk }}.txt
           fi
       - name: Run x8 and capture output
+        env:
+          CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
           mkdir -p x8-results-${{ matrix.chunk }}
           HEADER_ARGS=""
-          if [[ -n "${{ github.event.inputs.custom_headers }}" ]]; then
-            HEADER_ARGS="-H '${{ github.event.inputs.custom_headers }}'"
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -H 'Cookie: $CUSTOM_COOKIE'"
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -H '$CUSTOM_HEADER'"
           fi
 
           if [[ -s "x8-chunk-${{ matrix.chunk }}.txt" ]]; then
@@ -186,7 +170,7 @@ jobs:
 
   kxss-scan:
     needs: [fetch-results, consolidate-httpx]
-    if: "${{ github.event.inputs.run_kxss == 'true' && needs.fetch-results.outputs.params_exist == 'true' }}"
+    if: "github.event.client_payload.run_kxss == 'true' && needs.fetch-results.outputs.params_exist == 'true'"
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -206,7 +190,18 @@ jobs:
           go install github.com/Emoe/kxss@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
       - name: Run kxss on consolidated results
+        env:
+          CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
+          HEADER_ARGS=""
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -header 'Cookie: $CUSTOM_COOKIE'"
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -header '$CUSTOM_HEADER'"
+          fi
+
           mkdir -p kxss-results-${{ matrix.chunk }}
           if [ -s consolidated-httpx-results/all-httpx.txt ]; then
             TOTAL_LINES=$(wc -l < consolidated-httpx-results/all-httpx.txt)
@@ -224,7 +219,7 @@ jobs:
                     echo "${url}?${param}=KXSS"
                   fi
                 done < combined-results/unfurl-params.txt
-              done | sort -u | kxss -timeout 300 -threads 50 > kxss-results-${{ matrix.chunk }}/kxss-output.txt
+              done | sort -u | eval "kxss -timeout 300 -threads 50 $HEADER_ARGS" > kxss-results-${{ matrix.chunk }}/kxss-output.txt
             else
               touch kxss-results-${{ matrix.chunk }}/kxss-output.txt
             fi
@@ -258,11 +253,11 @@ jobs:
           path: all-results
       - name: Push results to storage repo
         run: |
-          git clone ${{ github.event.inputs.storage_repo }} storage
-          mkdir -p storage/${{ github.event.inputs.target_name }}/xss
+          git clone ${{ github.event.client_payload.storage_repo }} storage
+          mkdir -p storage/${{ github.event.client_payload.target_name }}/xss
 
-          X8_FILE="storage/${{ github.event.inputs.target_name }}/xss/x8-reflected.txt"
-          KXSS_FILE="storage/${{ github.event.inputs.target_name }}/xss/kxss-vulnerable.txt"
+          X8_FILE="storage/${{ github.event.client_payload.target_name }}/xss/x8-reflected.txt"
+          KXSS_FILE="storage/${{ github.event.client_payload.target_name }}/xss/kxss-vulnerable.txt"
 
           if [[ -d "all-results/x8-results-chunk-1" ]]; then
             find all-results -type f -name "x8-reflected.txt" -exec cat {} + > "$X8_FILE"
@@ -275,7 +270,7 @@ jobs:
           cd storage
           git add .
           if ! git diff --staged --quiet; then
-            git commit -m "Update XSS results for ${{ github.event.inputs.target_name }}"
+            git commit -m "Update XSS results for ${{ github.event.client_payload.target_name }}"
             git push
           else
             echo "No changes to commit"
