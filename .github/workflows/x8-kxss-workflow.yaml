@@ -14,16 +14,17 @@ jobs:
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
         run: |
-          mkdir -p ~/.ssh/
-          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+
       - name: Clone storage repo and copy files
         run: |
-          git clone ${{ github.event.client_payload.storage_repo }} storage
+          git clone "${{ github.event.client_payload.storage_repo }}" storage
           mkdir -p combined-results
-          # Copy all files from the target directory, which should include live-urls.txt and params.txt
-          cp storage/${{ github.event.client_payload.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
+          cp storage/"${{ github.event.client_payload.target_name }}"/* combined-results/ 2>/dev/null || echo "No files to copy"
+
       - name: Check if URLs exist
         id: check_files
         run: |
@@ -32,6 +33,7 @@ jobs:
           else
             echo "urls_exist=false" >> $GITHUB_OUTPUT
           fi
+
       - name: Upload combined-results artifact
         uses: actions/upload-artifact@v4
         with:
@@ -40,49 +42,49 @@ jobs:
 
   x8-scan:
     needs: fetch-results
-    if: "github.event.client_payload.run_x8 == 'true' && needs.fetch-results.outputs.urls_exist == 'true'"
+    # run only if run_x8 is true AND we actually have URLs
+    if: ${{ github.event.client_payload.run_x8 && needs.fetch-results.outputs.urls_exist == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        chunk: [1,2,3,4,5,6,7,8,9,10]
     steps:
-      - name: Download artifacts
+      - name: Download combined-results
         uses: actions/download-artifact@v4
         with:
           name: combined-results
           path: artifacts/
+
       - name: Install x8
         run: |
           wget https://github.com/Sh1Yo/x8/releases/latest/download/x8-linux-x86_64 -O x8
-          chmod +x x8 && sudo mv x8 /usr/local/bin/
+          chmod +x x8
+          sudo mv x8 /usr/local/bin/
+
       - name: Run x8
         env:
           CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
           CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
-          HEADER_ARGS=""
+          # build header arguments
+          hdr_args=()
           if [[ -n "$CUSTOM_COOKIE" ]]; then
-            HEADER_ARGS="$HEADER_ARGS -H 'Cookie: $CUSTOM_COOKIE'"
+            hdr_args+=(-H "Cookie: $CUSTOM_COOKIE")
           fi
           if [[ -n "$CUSTOM_HEADER" ]]; then
-            HEADER_ARGS="$HEADER_ARGS -H '$CUSTOM_HEADER'"
-          fi
-
-          PARAMS_FILE="artifacts/params.txt"
-          PARAMS_ARG=""
-          if [[ -f "$PARAMS_FILE" ]]; then
-            PARAMS_ARG="-w $PARAMS_FILE"
+            hdr_args+=(-H "$CUSTOM_HEADER")
           fi
 
           mkdir -p x8-results-${{ matrix.chunk }}
-          TOTAL=$(wc -l < artifacts/live-urls.txt)
-          LINES=$(( (TOTAL + 10 - 1) / 10 ))
-          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
-          END=$((${{ matrix.chunk }} * LINES))
-          sed -n "${START},${END}p" artifacts/live-urls.txt | \
-            while read -r url; do
-              eval "unbuffer x8 -u '$url' $PARAMS_ARG $HEADER_ARGS"
-            done > x8-results-${{ matrix.chunk }}/x8.txt
+          total=$(wc -l < artifacts/live-urls.txt)
+          per_chunk=$(( (total + 10 - 1) / 10 ))
+          start=$(( (${{ matrix.chunk }} - 1) * per_chunk + 1 ))
+          end=$(( ${{ matrix.chunk }} * per_chunk ))
+
+          sed -n "${start},${end}p" artifacts/live-urls.txt | \
+            xargs -I {} -P 4 bash -c 'x8 -u "$1" "${hdr_args[@]}" -w artifacts/params.txt' _ {} \
+            > x8-results-${{ matrix.chunk }}/x8.txt
+
       - name: Upload x8 results
         uses: actions/upload-artifact@v4
         with:
@@ -91,56 +93,58 @@ jobs:
 
   kxss-scan:
     needs: fetch-results
-    if: "github.event.client_payload.run_kxss == 'true' && needs.fetch-results.outputs.urls_exist == 'true'"
+    if: ${{ github.event.client_payload.run_kxss && needs.fetch-results.outputs.urls_exist == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        chunk: [1,2,3,4,5,6,7,8,9,10]
     steps:
-      - name: Download artifacts
+      - name: Download combined-results
         uses: actions/download-artifact@v4
         with:
           name: combined-results
           path: artifacts/
+
       - name: Install kxss
         run: |
           go install github.com/Emoe/kxss@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
       - name: Run kxss
         env:
           CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
           CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
-          HEADER_ARGS=""
+          # build header args
+          hdr_args=()
           if [[ -n "$CUSTOM_COOKIE" ]]; then
-            HEADER_ARGS="$HEADER_ARGS -header 'Cookie: $CUSTOM_COOKIE'"
+            hdr_args+=(-header "Cookie: $CUSTOM_COOKIE")
           fi
           if [[ -n "$CUSTOM_HEADER" ]]; then
-            HEADER_ARGS="$HEADER_ARGS -header '$CUSTOM_HEADER'"
+            hdr_args+=(-header "$CUSTOM_HEADER")
           fi
 
           mkdir -p kxss-results-${{ matrix.chunk }}
-          TOTAL=$(wc -l < artifacts/live-urls.txt)
-          LINES=$(( (TOTAL + 10 - 1) / 10 ))
-          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
-          END=$((${{ matrix.chunk }} * LINES))
+          total=$(wc -l < artifacts/live-urls.txt)
+          per_chunk=$(( (total + 10 - 1) / 10 ))
+          start=$(( (${{ matrix.chunk }} - 1) * per_chunk + 1 ))
+          end=$(( ${{ matrix.chunk }} * per_chunk ))
 
-          URL_CHUNK=$(mktemp)
-          sed -n "${START},${END}p" artifacts/live-urls.txt > $URL_CHUNK
-
-          PARAMS_FILE="artifacts/params.txt"
-          if [[ -f "$PARAMS_FILE" ]]; then
+          sed -n "${start},${end}p" artifacts/live-urls.txt > chunk.txt
+          if [[ -f artifacts/params.txt ]]; then
             while read -r url; do
               while read -r param; do
-                if [[ "$url" == *"?"* ]]; then
+                if [[ "$url" == *\?* ]]; then
                   echo "${url}&${param}=KXSS"
                 else
                   echo "${url}?${param}=KXSS"
                 fi
-              done < "$PARAMS_FILE"
-            done < "$URL_CHUNK" | sort -u | eval "kxss $HEADER_ARGS" > kxss-results-${{ matrix.chunk }}/kxss.txt
+              done < artifacts/params.txt
+            done < chunk.txt | sort -u | xargs -P 4 kxss "${hdr_args[@]}" \
+              > kxss-results-${{ matrix.chunk }}/kxss.txt
           else
-            cat $URL_CHUNK | eval "kxss $HEADER_ARGS" > kxss-results-${{ matrix.chunk }}/kxss.txt
+            xargs -a chunk.txt -P 4 kxss "${hdr_args[@]}" \
+              > kxss-results-${{ matrix.chunk }}/kxss.txt
           fi
 
       - name: Upload kxss results
@@ -151,45 +155,46 @@ jobs:
 
   push-to-storage:
     needs: [x8-scan, kxss-scan]
-    if: always() # Always run this job to commit results, even if one scan fails or is skipped
+    if: always()   # commit even if scans fail or are skipped
     runs-on: ubuntu-latest
     steps:
       - name: Setup SSH and Git
         env:
           DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
         run: |
-          mkdir -p ~/.ssh/
-          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan github.com >> ~/.ssh/known_hosts
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
+
       - name: Download all scan results
         uses: actions/download-artifact@v4
         with:
           path: all-results
+
       - name: Push results to storage repo
         run: |
-          git clone ${{ github.event.client_payload.storage_repo }} storage
-          mkdir -p storage/${{ github.event.client_payload.target_name }}/xss
+          git clone "${{ github.event.client_payload.storage_repo }}" storage
+          mkdir -p storage/"${{ github.event.client_payload.target_name }}"/xss
 
-          X8_FILE="storage/${{ github.event.client_payload.target_name }}/xss/x8.txt"
-          KXSS_FILE="storage/${{ github.event.client_payload.target_name }}/xss/kxss.txt"
-
-          # Consolidate x8 results if the job ran
-          if [[ -d "all-results/x8-results-chunk-1" ]]; then
-            find all-results -type f -name "x8.txt" -exec cat {} + > "$X8_FILE"
+          # merge x8 if it ran
+          if [ -d all-results/x8-results-chunk-1 ]; then
+            find all-results -type f -name "x8.txt" -exec cat {} + \
+              > storage/"${{ github.event.client_payload.target_name }}"/xss/x8.txt
           fi
 
-          # Consolidate kxss results if the job ran
-          if [[ -d "all-results/kxss-results-chunk-1" ]]; then
-            find all-results -type f -name "kxss.txt" -exec cat {} + > "$KXSS_FILE"
+          # merge kxss if it ran
+          if [ -d all-results/kxss-results-chunk-1 ]; then
+            find all-results -type f -name "kxss.txt" -exec cat {} + \
+              > storage/"${{ github.event.client_payload.target_name }}"/xss/kxss.txt
           fi
 
           cd storage
           git add .
-          if ! git diff --staged --quiet; then
-            git commit -m "Update XSS results for ${{ github.event.client_payload.target_name }}"
+          if ! git diff --cached --quiet; then
+            git commit -m "Update XSS for ${{ github.event.client_payload.target_name }}"
             git push
           else
             echo "No changes to commit"
