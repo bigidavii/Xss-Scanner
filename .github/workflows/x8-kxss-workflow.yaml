@@ -15,6 +15,16 @@ on:
         description: 'Optional: Custom headers (e.g., Cookie: test=value)'
         required: false
         type: string
+      run_x8:
+        description: 'Run the x8 scanner?'
+        required: false
+        type: boolean
+        default: true
+      run_kxss:
+        description: 'Run the kxss scanner?'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   fetch-results:
@@ -43,6 +53,11 @@ jobs:
           else
             echo "urls_exist=false" >> $GITHUB_OUTPUT
           fi
+      - name: Upload combined-results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-results
+          path: combined-results/
 
   httpx-scan:
     needs: fetch-results
@@ -95,6 +110,7 @@ jobs:
 
   x8-scan:
     needs: consolidate-httpx
+    if: ${{ github.event.inputs.run_x8 && needs.fetch-results.outputs.urls_exist == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -127,6 +143,7 @@ jobs:
 
   kxss-scan:
     needs: consolidate-httpx
+    if: ${{ github.event.inputs.run_kxss && needs.fetch-results.outputs.urls_exist == 'true' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
