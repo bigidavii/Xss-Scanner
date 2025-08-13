@@ -43,13 +43,9 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts
       - name: Clone storage repo and copy files
         run: |
-          git clone ${{ github.event.client_payload.storage_repo }} storage
-          echo "--- Listing contents of cloned repository ---"
-          ls -R storage
-          echo "-------------------------------------------"
           git clone ${{ github.event.inputs.storage_repo }} storage
           mkdir -p combined-results
-          cp storage/${{ github.event.inputs.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
+          cp storage/${{ github.event.inputs.target_name }}/discovery/* combined-results/ 2>/dev/null || echo "No files to copy"
       - name: Check if files exist
         id: check_files
         run: |
