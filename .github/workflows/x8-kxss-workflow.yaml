@@ -1,30 +1,8 @@
-name: "2 - X8 & KXSS Scanning Workflow (Push to Storage Repo)"
+name: "XSS Scanner Workflow"
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_name:
-        description: 'Name of target folder in storage repo (e.g., example-com)'
-        required: true
-        type: string
-      storage_repo:
-        description: 'SSH URL of scan-results-storage repo'
-        required: true
-        type: string
-      custom_headers:
-        description: 'Optional: Custom headers (e.g., Cookie: test=value)'
-        required: false
-        type: string
-      run_x8:
-        description: 'Run the x8 scanner?'
-        required: false
-        type: boolean
-        default: true
-      run_kxss:
-        description: 'Run the kxss scanner?'
-        required: false
-        type: boolean
-        default: true
+  repository_dispatch:
+    types: [scanner-trigger]
 
 jobs:
   fetch-results:
@@ -40,11 +18,12 @@ jobs:
           echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan github.com >> ~/.ssh/known_hosts
-      - name: Clone storage repo
+      - name: Clone storage repo and copy files
         run: |
-          git clone ${{ github.event.inputs.storage_repo }} storage
+          git clone ${{ github.event.client_payload.storage_repo }} storage
           mkdir -p combined-results
-          cp storage/${{ github.event.inputs.target_name }}/discovery/* combined-results/ || true
+          # Copy all files from the target directory, which should include live-urls.txt and params.txt
+          cp storage/${{ github.event.client_payload.target_name }}/* combined-results/ 2>/dev/null || echo "No files to copy"
       - name: Check if URLs exist
         id: check_files
         run: |
@@ -59,58 +38,9 @@ jobs:
           name: combined-results
           path: combined-results/
 
-  httpx-scan:
-    needs: fetch-results
-    if: needs.fetch-results.outputs.urls_exist == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    steps:
-      - name: Download combined results
-        uses: actions/download-artifact@v4
-        with:
-          name: combined-results
-          path: combined-results/
-      - name: Install httpx
-        run: |
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-      - name: Run httpx
-        run: |
-          mkdir -p httpx-results-${{ matrix.chunk }}
-          TOTAL=$(wc -l < combined-results/live-urls.txt)
-          LINES=$(( (TOTAL + 10 - 1) / 10 ))
-          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
-          END=$((${{ matrix.chunk }} * LINES))
-          sed -n "${START},${END}p" combined-results/live-urls.txt | httpx -silent -threads 30 -timeout 10 > httpx-results-${{ matrix.chunk }}/httpx.txt
-      - name: Upload httpx results
-        uses: actions/upload-artifact@v4
-        with:
-          name: httpx-results-chunk-${{ matrix.chunk }}
-          path: httpx-results-${{ matrix.chunk }}/
-
-  consolidate-httpx:
-    needs: httpx-scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all httpx chunks
-        uses: actions/download-artifact@v4
-        with:
-          path: httpx-chunks
-      - name: Merge httpx results
-        run: |
-          mkdir -p consolidated-httpx
-          find httpx-chunks -type f -name "httpx.txt" -exec cat {} + | sort -u > consolidated-httpx/all-httpx.txt
-      - name: Upload consolidated httpx
-        uses: actions/upload-artifact@v4
-        with:
-          name: consolidated-httpx
-          path: consolidated-httpx/
-
   x8-scan:
-    needs: consolidate-httpx
-    if: ${{ github.event.inputs.run_x8 && needs.fetch-results.outputs.urls_exist == 'true' }}
+    needs: fetch-results
+    if: "github.event.client_payload.run_x8 == 'true' && needs.fetch-results.outputs.urls_exist == 'true'"
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -119,21 +49,39 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          name: combined-results
           path: artifacts/
       - name: Install x8
         run: |
           wget https://github.com/Sh1Yo/x8/releases/latest/download/x8-linux-x86_64 -O x8
           chmod +x x8 && sudo mv x8 /usr/local/bin/
       - name: Run x8
+        env:
+          CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
+          HEADER_ARGS=""
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -H 'Cookie: $CUSTOM_COOKIE'"
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -H '$CUSTOM_HEADER'"
+          fi
+
+          PARAMS_FILE="artifacts/params.txt"
+          PARAMS_ARG=""
+          if [[ -f "$PARAMS_FILE" ]]; then
+            PARAMS_ARG="-w $PARAMS_FILE"
+          fi
+
           mkdir -p x8-results-${{ matrix.chunk }}
-          TOTAL=$(wc -l < artifacts/consolidated-httpx/all-httpx.txt)
+          TOTAL=$(wc -l < artifacts/live-urls.txt)
           LINES=$(( (TOTAL + 10 - 1) / 10 ))
           START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
           END=$((${{ matrix.chunk }} * LINES))
-          sed -n "${START},${END}p" artifacts/consolidated-httpx/all-httpx.txt | \
+          sed -n "${START},${END}p" artifacts/live-urls.txt | \
             while read -r url; do
-              unbuffer x8 -u "$url" -w artifacts/combined-results/params.txt
+              eval "unbuffer x8 -u '$url' $PARAMS_ARG $HEADER_ARGS"
             done > x8-results-${{ matrix.chunk }}/x8.txt
       - name: Upload x8 results
         uses: actions/upload-artifact@v4
@@ -142,8 +90,8 @@ jobs:
           path: x8-results-${{ matrix.chunk }}/
 
   kxss-scan:
-    needs: consolidate-httpx
-    if: ${{ github.event.inputs.run_kxss && needs.fetch-results.outputs.urls_exist == 'true' }}
+    needs: fetch-results
+    if: "github.event.client_payload.run_kxss == 'true' && needs.fetch-results.outputs.urls_exist == 'true'"
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -152,19 +100,36 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          name: combined-results
           path: artifacts/
       - name: Install kxss
         run: |
           go install github.com/Emoe/kxss@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
       - name: Run kxss
+        env:
+          CUSTOM_COOKIE: ${{ github.event.client_payload.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.client_payload.custom_header }}
         run: |
+          HEADER_ARGS=""
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -header 'Cookie: $CUSTOM_COOKIE'"
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS="$HEADER_ARGS -header '$CUSTOM_HEADER'"
+          fi
+
           mkdir -p kxss-results-${{ matrix.chunk }}
-          TOTAL=$(wc -l < artifacts/consolidated-httpx/all-httpx.txt)
+          TOTAL=$(wc -l < artifacts/live-urls.txt)
           LINES=$(( (TOTAL + 10 - 1) / 10 ))
           START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
           END=$((${{ matrix.chunk }} * LINES))
-          sed -n "${START},${END}p" artifacts/consolidated-httpx/all-httpx.txt | \
+
+          URL_CHUNK=$(mktemp)
+          sed -n "${START},${END}p" artifacts/live-urls.txt > $URL_CHUNK
+
+          PARAMS_FILE="artifacts/params.txt"
+          if [[ -f "$PARAMS_FILE" ]]; then
             while read -r url; do
               while read -r param; do
                 if [[ "$url" == *"?"* ]]; then
@@ -172,8 +137,12 @@ jobs:
                 else
                   echo "${url}?${param}=KXSS"
                 fi
-              done < artifacts/combined-results/params.txt
-            done | sort -u | kxss > kxss-results-${{ matrix.chunk }}/kxss.txt
+              done < "$PARAMS_FILE"
+            done < "$URL_CHUNK" | sort -u | eval "kxss $HEADER_ARGS" > kxss-results-${{ matrix.chunk }}/kxss.txt
+          else
+            cat $URL_CHUNK | eval "kxss $HEADER_ARGS" > kxss-results-${{ matrix.chunk }}/kxss.txt
+          fi
+
       - name: Upload kxss results
         uses: actions/upload-artifact@v4
         with:
@@ -182,6 +151,7 @@ jobs:
 
   push-to-storage:
     needs: [x8-scan, kxss-scan]
+    if: always() # Always run this job to commit results, even if one scan fails or is skipped
     runs-on: ubuntu-latest
     steps:
       - name: Setup SSH and Git
@@ -200,11 +170,27 @@ jobs:
           path: all-results
       - name: Push results to storage repo
         run: |
-          git clone ${{ github.event.inputs.storage_repo }} storage
-          mkdir -p storage/${{ github.event.inputs.target_name }}/xss
-          find all-results -type f -name "x8.txt" -exec cat {} + > storage/${{ github.event.inputs.target_name }}/xss/x8.txt || true
-          find all-results -type f -name "kxss.txt" -exec cat {} + > storage/${{ github.event.inputs.target_name }}/xss/kxss.txt || true
+          git clone ${{ github.event.client_payload.storage_repo }} storage
+          mkdir -p storage/${{ github.event.client_payload.target_name }}/xss
+
+          X8_FILE="storage/${{ github.event.client_payload.target_name }}/xss/x8.txt"
+          KXSS_FILE="storage/${{ github.event.client_payload.target_name }}/xss/kxss.txt"
+
+          # Consolidate x8 results if the job ran
+          if [[ -d "all-results/x8-results-chunk-1" ]]; then
+            find all-results -type f -name "x8.txt" -exec cat {} + > "$X8_FILE"
+          fi
+
+          # Consolidate kxss results if the job ran
+          if [[ -d "all-results/kxss-results-chunk-1" ]]; then
+            find all-results -type f -name "kxss.txt" -exec cat {} + > "$KXSS_FILE"
+          fi
+
           cd storage
           git add .
-          git commit -m "Update XSS results for ${{ github.event.inputs.target_name }}" || echo "No changes"
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "Update XSS results for ${{ github.event.client_payload.target_name }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
