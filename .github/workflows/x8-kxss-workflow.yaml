@@ -1,0 +1,193 @@
+name: "2 - X8 & KXSS Scanning Workflow (Push to Storage Repo)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_name:
+        description: 'Name of target folder in storage repo (e.g., example-com)'
+        required: true
+        type: string
+      storage_repo:
+        description: 'SSH URL of scan-results-storage repo'
+        required: true
+        type: string
+      custom_headers:
+        description: 'Optional: Custom headers (e.g., Cookie: test=value)'
+        required: false
+        type: string
+
+jobs:
+  fetch-results:
+    runs-on: ubuntu-latest
+    outputs:
+      urls_exist: ${{ steps.check_files.outputs.urls_exist }}
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Clone storage repo
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p combined-results
+          cp storage/${{ github.event.inputs.target_name }}/discovery/* combined-results/ || true
+      - name: Check if URLs exist
+        id: check_files
+        run: |
+          if [[ -s "combined-results/live-urls.txt" ]]; then
+            echo "urls_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "urls_exist=false" >> $GITHUB_OUTPUT
+          fi
+
+  httpx-scan:
+    needs: fetch-results
+    if: needs.fetch-results.outputs.urls_exist == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Download combined results
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-results
+          path: combined-results/
+      - name: Install httpx
+        run: |
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Run httpx
+        run: |
+          mkdir -p httpx-results-${{ matrix.chunk }}
+          TOTAL=$(wc -l < combined-results/live-urls.txt)
+          LINES=$(( (TOTAL + 10 - 1) / 10 ))
+          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
+          END=$((${{ matrix.chunk }} * LINES))
+          sed -n "${START},${END}p" combined-results/live-urls.txt | httpx -silent -threads 30 -timeout 10 > httpx-results-${{ matrix.chunk }}/httpx.txt
+      - name: Upload httpx results
+        uses: actions/upload-artifact@v4
+        with:
+          name: httpx-results-chunk-${{ matrix.chunk }}
+          path: httpx-results-${{ matrix.chunk }}/
+
+  consolidate-httpx:
+    needs: httpx-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all httpx chunks
+        uses: actions/download-artifact@v4
+        with:
+          path: httpx-chunks
+      - name: Merge httpx results
+        run: |
+          mkdir -p consolidated-httpx
+          find httpx-chunks -type f -name "httpx.txt" -exec cat {} + | sort -u > consolidated-httpx/all-httpx.txt
+      - name: Upload consolidated httpx
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-httpx
+          path: consolidated-httpx/
+
+  x8-scan:
+    needs: consolidate-httpx
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Install x8
+        run: |
+          wget https://github.com/Sh1Yo/x8/releases/latest/download/x8-linux-x86_64 -O x8
+          chmod +x x8 && sudo mv x8 /usr/local/bin/
+      - name: Run x8
+        run: |
+          mkdir -p x8-results-${{ matrix.chunk }}
+          TOTAL=$(wc -l < artifacts/consolidated-httpx/all-httpx.txt)
+          LINES=$(( (TOTAL + 10 - 1) / 10 ))
+          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
+          END=$((${{ matrix.chunk }} * LINES))
+          sed -n "${START},${END}p" artifacts/consolidated-httpx/all-httpx.txt | \
+            while read -r url; do
+              unbuffer x8 -u "$url" -w artifacts/combined-results/params.txt
+            done > x8-results-${{ matrix.chunk }}/x8.txt
+      - name: Upload x8 results
+        uses: actions/upload-artifact@v4
+        with:
+          name: x8-results-chunk-${{ matrix.chunk }}
+          path: x8-results-${{ matrix.chunk }}/
+
+  kxss-scan:
+    needs: consolidate-httpx
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Install kxss
+        run: |
+          go install github.com/Emoe/kxss@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Run kxss
+        run: |
+          mkdir -p kxss-results-${{ matrix.chunk }}
+          TOTAL=$(wc -l < artifacts/consolidated-httpx/all-httpx.txt)
+          LINES=$(( (TOTAL + 10 - 1) / 10 ))
+          START=$((((${{ matrix.chunk }} - 1) * LINES) + 1))
+          END=$((${{ matrix.chunk }} * LINES))
+          sed -n "${START},${END}p" artifacts/consolidated-httpx/all-httpx.txt | \
+            while read -r url; do
+              while read -r param; do
+                if [[ "$url" == *"?"* ]]; then
+                  echo "${url}&${param}=KXSS"
+                else
+                  echo "${url}?${param}=KXSS"
+                fi
+              done < artifacts/combined-results/params.txt
+            done | sort -u | kxss > kxss-results-${{ matrix.chunk }}/kxss.txt
+      - name: Upload kxss results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kxss-results-chunk-${{ matrix.chunk }}
+          path: kxss-results-${{ matrix.chunk }}/
+
+  push-to-storage:
+    needs: [x8-scan, kxss-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+      - name: Push results to storage repo
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p storage/${{ github.event.inputs.target_name }}/xss
+          find all-results -type f -name "x8.txt" -exec cat {} + > storage/${{ github.event.inputs.target_name }}/xss/x8.txt || true
+          find all-results -type f -name "kxss.txt" -exec cat {} + > storage/${{ github.event.inputs.target_name }}/xss/kxss.txt || true
+          cd storage
+          git add .
+          git commit -m "Update XSS results for ${{ github.event.inputs.target_name }}" || echo "No changes"
+          git push
